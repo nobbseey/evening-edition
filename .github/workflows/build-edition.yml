@@ -1,0 +1,36 @@
+name: Build tonight's edition
+
+on:
+  schedule:
+    - cron: '0 7 * * *'
+    - cron: '0 8 * * *'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Build the edition
+        run: node scripts/build-edition.mjs
+
+      - name: Commit and push if the edition changed
+        run: |
+          git config user.name "evening-edition-bot"
+          git config user.email "actions@github.com"
+          git add data/edition.json
+          git diff --quiet --cached || git commit -m "Update tonight's edition"
+          git push
