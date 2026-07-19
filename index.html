@@ -492,10 +492,11 @@
     </div>
 
     <script>
-        // The nightly GitHub Action writes this file directly into the
-        // repo, so the app just fetches it as a plain static file —
-        // no server, no API keys, no separate deployment step.
-        const EDITION_JSON_PATH = './data/edition.json';
+        const FEEDS = {
+            canberra: 'https://the-riotact.com/feed',
+            australia: 'https://www.theguardian.com/australia-news/rss',
+            world: 'https://www.theguardian.com/world/rss'
+        };
 
         let activeEditionData = null;
         let currentlyViewingArticle = null;
@@ -669,41 +670,253 @@
             if(size === 'xlarge') document.getElementById('btn-xlrg').classList.add('active');
         }
 
+        function sanitizeAndFormatContent(html) {
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = html;
+            
+            const removeTags = ['script', 'style', 'iframe', 'noscript', 'form', 'svg', 'button', 'img'];
+            removeTags.forEach(tag => {
+                const els = tempDiv.getElementsByTagName(tag);
+                while(els.length > 0) { els[0].parentNode.removeChild(els[0]); }
+            });
+
+            const paragraphs = tempDiv.getElementsByTagName('p');
+            let outputHTML = '';
+            for (let p of paragraphs) {
+                const text = p.textContent.trim();
+                if (text.length > 35) { 
+                    outputHTML += `<p>${text}</p>`;
+                }
+            }
+
+            if (!outputHTML) outputHTML = `<p>${tempDiv.textContent.trim()}</p>`;
+            return outputHTML;
+        }
+
+        function getSnippet(html) {
+            const tempDiv = document.createElement('div');
+            tempDiv.innerHTML = html;
+            const cleanText = tempDiv.textContent || tempDiv.innerText || "";
+            const trimmed = cleanText.replace(/\s+/g, ' ').trim();
+            return trimmed.length > 140 ? trimmed.substring(0, 137) + '...' : trimmed;
+        }
+
+        // Advanced Embedded Image Scraper fallback
+        function scrapeImage(itemData, rawHtmlDescription) {
+            if(itemData.thumbnail && !itemData.thumbnail.includes('avatar') && !itemData.thumbnail.includes('profile')) {
+                return itemData.thumbnail;
+            }
+            if(itemData.enclosure && itemData.enclosure.link && itemData.enclosure.type && itemData.enclosure.type.includes('image')) {
+                return itemData.enclosure.link;
+            }
+            const match = rawHtmlDescription.match(/<img[^>]+src="([^">]+)"/);
+            if(match && match[1]) {
+                return match[1];
+            }
+            return null;
+        }
+
+        // Live Deep Page Scraper: Pulls full high-res social cover image & clean text body
+        async function scrapeFullWebpage(url) {
+            try {
+                const res = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`);
+                if(!res.ok) return null;
+                const json = await res.json();
+                
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(json.contents, "text/html");
+                
+                // 1. Scrape absolute og:image URL
+                let imageUrl = null;
+                const ogImg = doc.querySelector('meta[property="og:image"]');
+                if (ogImg) imageUrl = ogImg.getAttribute('content');
+                if (!imageUrl) {
+                    const twitterImg = doc.querySelector('meta[name="twitter:image"]');
+                    if (twitterImg) imageUrl = twitterImg.getAttribute('content');
+                }
+                if (imageUrl && !imageUrl.startsWith('http')) {
+                    try { imageUrl = new URL(imageUrl, url).href; } catch(e) {}
+                }
+
+                // 2. Scrape entire text block omitting headers/footers/sidebars
+                const articleSelectors = [
+                    'article', 
+                    '.entry-content', 
+                    '.article-body-commercial-selector', 
+                    '.article-body-viewer-wrapper', 
+                    '.story-body', 
+                    '.main-content'
+                ];
+                
+                let bodyHTML = '';
+                for (let selector of articleSelectors) {
+                    const block = doc.querySelector(selector);
+                    if (block) {
+                        const paragraphs = block.querySelectorAll('p');
+                        const cleanList = [];
+                        paragraphs.forEach(p => {
+                            const txt = p.textContent.trim();
+                            if (txt.length > 50 && !p.closest('footer') && !p.closest('aside') && !p.closest('header')) {
+                                cleanList.push(`<p>${p.innerHTML}</p>`);
+                            }
+                        });
+                        if (cleanList.length > 2) {
+                            bodyHTML = cleanList.join('');
+                            break;
+                        }
+                    }
+                }
+
+                // Generic DOM crawl if customized selectors fail
+                if (!bodyHTML) {
+                    const allParagraphs = doc.querySelectorAll('p');
+                    const cleanList = [];
+                    allParagraphs.forEach(p => {
+                        const txt = p.textContent.trim();
+                        if (txt.length > 65 && 
+                            !p.closest('header') && !p.closest('footer') && 
+                            !p.closest('nav') && !p.closest('aside') && 
+                            !p.closest('.related') && !p.closest('.comment-list')) {
+                            cleanList.push(`<p>${p.innerHTML}</p>`);
+                        }
+                    });
+                    bodyHTML = cleanList.join('');
+                }
+
+                return { content: bodyHTML, imageUrl: imageUrl };
+            } catch (e) {
+                console.error("Scraper encountered standard connection block", e);
+                return null;
+            }
+        }
+
+        // Background Enrichment Engine: Enriches articles with full texts and pictures sequentially
+        async function enrichArticleBackground(sectionKey, index) {
+            const article = activeEditionData[sectionKey][index];
+            if (!article || article.isScraped) return;
+
+            const scraped = await scrapeFullWebpage(article.link);
+            if (scraped) {
+                if (scraped.imageUrl) article.imageUrl = scraped.imageUrl;
+                if (scraped.content) article.content = scraped.content;
+                article.isScraped = true;
+
+                // Re-render layout so images fade in cleanly on the front page
+                renderSection(`section-${sectionKey}`, activeEditionData[sectionKey], sectionKey);
+
+                // Update local storage layout cache
+                const targetDate = getTargetEditionDate();
+                localStorage.setItem('newspaper_edition_' + targetDate, JSON.stringify(activeEditionData));
+            }
+        }
+
+        async function triggerBackgroundEnrichment() {
+            const sections = ['canberra', 'australia', 'world'];
+            for (let section of sections) {
+                const list = activeEditionData[section];
+                if (!list) continue;
+                for (let i = 0; i < list.length; i++) {
+                    if (!list[i].isScraped) {
+                        // Sequential delay to prevent browser network choking
+                        await enrichArticleBackground(section, i);
+                    }
+                }
+            }
+        }
+
+        async function fetchFeed(url, sourceLabel) {
+            try {
+                const res = await fetch(`https://api.rss2json.com/v1/api.json?rss_url=${encodeURIComponent(url)}`);
+                if (!res.ok) throw new Error();
+                const json = await res.json();
+                if (!json || json.status !== 'ok') throw new Error();
+                
+                return json.items.map(i => {
+                    const htmlContext = i.content || i.description || '';
+                    return {
+                        title: i.title,
+                        link: i.link,
+                        snippet: getSnippet(i.description),
+                        content: sanitizeAndFormatContent(htmlContext),
+                        imageUrl: scrapeImage(i, htmlContext),
+                        source: sourceLabel,
+                        isScraped: false
+                    };
+                });
+            } catch (err) {
+                // Fallback direct XML parser
+                const res = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`);
+                const json = await res.json();
+                const parser = new DOMParser();
+                const xml = parser.parseFromString(json.contents, "text/xml");
+                const items = xml.querySelectorAll("item");
+                const list = [];
+                
+                items.forEach(item => {
+                    const title = item.querySelector("title")?.textContent || "";
+                    const link = item.querySelector("link")?.textContent || "";
+                    const desc = item.querySelector("description")?.textContent || "";
+                    const contentNode = item.getElementsByTagNameNS("http://purl.org/rss/1.0/modules/content/", "encoded")[0];
+                    let content = contentNode ? contentNode.textContent : desc;
+
+                    let fallbackImg = null;
+                    const enc = item.querySelector("enclosure[type^='image']");
+                    if(enc) fallbackImg = enc.getAttribute("url");
+                    if(!fallbackImg) {
+                        const mMatch = desc.match(/<img[^>]+src="([^">]+)"/);
+                        if(mMatch) fallbackImg = mMatch[1];
+                    }
+
+                    list.push({
+                        title,
+                        link,
+                        snippet: getSnippet(desc),
+                        content: sanitizeAndFormatContent(content),
+                        imageUrl: fallbackImg,
+                        source: sourceLabel,
+                        isScraped: false
+                    });
+                });
+                return list;
+            }
+        }
+
         async function printNewspaper() {
             document.getElementById('loader').style.display = 'flex';
             const targetDate = getTargetEditionDate();
-            document.getElementById('loader-status').innerText = "Fetching tonight's edition...";
 
             try {
-                // Cache-busting query param stops GitHub Pages' CDN (and the
-                // browser) from serving a stale copy of the file.
-                const res = await fetch(`${EDITION_JSON_PATH}?t=${Date.now()}`);
-                if (!res.ok) throw new Error(`Could not load edition.json (${res.status})`);
-                const newspaper = await res.json();
+                document.getElementById('loader-status').innerText = "Indexing Riotact Canberra records...";
+                const canberraRaw = await fetchFeed(FEEDS.canberra, "Riotact | Canberra");
+                
+                document.getElementById('loader-status').innerText = "Reviewing Guardian Australia wire prints...";
+                const australiaRaw = await fetchFeed(FEEDS.australia, "The Guardian | National");
+                
+                document.getElementById('loader-status').innerText = "Sorting global international dispatches...";
+                const worldRaw = await fetchFeed(FEEDS.world, "The Guardian | International");
 
-                const hasContent = (newspaper.canberra?.length || 0) + (newspaper.australia?.length || 0) + (newspaper.world?.length || 0) > 0;
-                if (!hasContent) throw new Error('Edition file is empty (nightly job may not have run yet)');
+                const newspaper = {
+                    date: targetDate,
+                    canberra: canberraRaw.slice(0, 5),
+                    australia: australiaRaw.slice(0, 5),
+                    world: worldRaw.slice(0, 5)
+                };
 
-                localStorage.setItem('newspaper_edition_' + newspaper.date, JSON.stringify(newspaper));
+                localStorage.setItem('newspaper_edition_' + targetDate, JSON.stringify(newspaper));
                 activeEditionData = newspaper;
-
-                if (newspaper.date && newspaper.date !== targetDate) {
-                    showStatusBanner(`Showing the ${formatShortDate(newspaper.date)} edition — tonight's hasn't been published yet.`);
-                } else {
-                    clearStatusBanner();
-                }
+                clearStatusBanner();
                 renderNewspaper();
             } catch (err) {
-                console.error("Edition fetch failed, trying local fallback:", err);
+                console.error(err);
                 const fallback = getBestAvailableCachedEdition();
                 if (fallback) {
                     activeEditionData = fallback;
                     renderNewspaper();
                     showStatusBanner(fallback.date === targetDate
-                        ? "Showing today's edition from your last successful update."
+                        ? "Showing today's edition from earlier — the news service is having a moment."
                         : `Couldn't reach the news service tonight — showing the ${formatShortDate(fallback.date)} edition instead.`);
                 } else {
-                    showStatusBanner("Couldn't load tonight's news. Please check your internet connection, then tap Refresh below.");
+                    showStatusBanner("Couldn't load the news right now. Please check your connection, then tap Refresh below.");
                 }
             } finally {
                 document.getElementById('loader').style.display = 'none';
@@ -735,8 +948,9 @@
                 banner = document.createElement('div');
                 banner.id = 'status-banner';
                 banner.style.cssText = 'background: var(--tag-bg); color: var(--accent-color); border: 1px solid var(--accent-color); border-radius: 8px; padding: 12px 16px; margin-bottom: 20px; font-size: var(--font-body); text-align: center; font-weight: bold;';
-                const ledger = document.getElementById('weather-ledger-shelf').parentElement;
-                ledger.insertBefore(banner, document.getElementById('weather-ledger-shelf'));
+                const container = document.querySelector('.container');
+                const ledger = document.querySelector('.weather-ledger') || container.firstChild;
+                container.insertBefore(banner, ledger);
             }
             banner.innerText = message;
             banner.style.display = 'block';
@@ -757,6 +971,9 @@
             renderSection('section-canberra', activeEditionData.canberra, 'canberra');
             renderSection('section-australia', activeEditionData.australia, 'australia');
             renderSection('section-world', activeEditionData.world, 'world');
+
+            // Fire the quiet background crawler
+            triggerBackgroundEnrichment();
         }
 
         function renderSection(elementId, articles, sectionKey) {
@@ -791,18 +1008,43 @@
             });
         }
 
-        function readArticle(sectionKey, index) {
+        async function readArticle(sectionKey, index) {
             const article = activeEditionData[sectionKey][index];
             currentlyViewingArticle = article;
 
             // Strict Reset Scroll to top of Reader container before rendering new text
             document.getElementById('reader-view').scrollTop = 0;
 
+            // Open reader and display immediate high-end loading status
             document.getElementById('reader-title').innerText = article.title;
             document.getElementById('reader-meta').innerText = article.source;
+            document.getElementById('reader-body').innerHTML = `
+                <div class="spinner"></div>
+                <p style="text-align: center; color: var(--meta-color); font-style: italic;">
+                    Retrieving direct full text and editorial photos from the publisher archives...
+                </p>
+            `;
+            document.getElementById('reader-hero-target').innerHTML = '';
             document.getElementById('reader-view').classList.add('active');
 
-            // Full article text already arrived pre-baked from the edition service
+            // If background scraper hasn't finished this article yet, prioritize and scrape immediately
+            if(!article.isScraped) {
+                const scraped = await scrapeFullWebpage(article.link);
+                if (scraped) {
+                    if (scraped.content) article.content = scraped.content;
+                    if (scraped.imageUrl) article.imageUrl = scraped.imageUrl;
+                    article.isScraped = true;
+
+                    // Update cached memory data
+                    const targetDate = getTargetEditionDate();
+                    localStorage.setItem('newspaper_edition_' + targetDate, JSON.stringify(activeEditionData));
+                    
+                    // Update preview cards
+                    renderSection(`section-${sectionKey}`, activeEditionData[sectionKey], sectionKey);
+                }
+            }
+
+            // Render absolute full article text
             document.getElementById('reader-body').innerHTML = article.content;
             
             const saved = getSavedArticles();
