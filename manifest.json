@@ -1,0 +1,16 @@
+{
+  "name": "The Evening Edition",
+  "short_name": "Evening News",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "background_color": "#f5edd6",
+  "theme_color": "#8c1d1d",
+  "orientation": "portrait",
+  "icons": [
+    {
+      "src": "https://img.icons8.com/ios-filled/512/8c1d1d/news.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "name": "evening-edition-builder",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@mozilla/readability": "^0.5.0",
+    "linkedom": "^0.18.5"
+  }
+}
